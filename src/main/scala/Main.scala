@@ -14,7 +14,7 @@ import com.armanbilge.vilcacora.runtime._
 import vilcacora.onnx.Translator
 object Main extends IOApp {
 
-  def loadModelFromPath(modelPath: String): IO[ModelProto] = IO {
+  def loadModelFromPath(modelPath: String): IO[ModelProto] = IO.blocking {
     val stream: InputStream = getClass.getResourceAsStream(modelPath)
     if (stream == null)
       throw new IllegalArgumentException(s"Resource not found: $modelPath")
@@ -22,6 +22,11 @@ object Main extends IOApp {
 
     finally stream.close()
   }
+
+  def translateModel(proto: ModelProto): IO[ModelIR] =
+    IO.blocking {
+      translate(proto).fold(err => throw new RuntimeException(err), identity)
+    }
 
   val helloWorldService = HttpRoutes
     .of[IO] { case GET -> Root / "hello" / name =>
@@ -52,11 +57,9 @@ object Main extends IOApp {
     for {
       _ <- IO.println("Loading Model")
       modelproto <- loadModelFromPath("/mnist12_static.onnx")
-      modelIR <- IO.fromEither(
-        translate(modelproto).left.map(errStr => new RuntimeException(errStr)),
-      )
+      modelIR <- translateModel(modelproto)
       _ <- IO.println("Succesfully Loaded Model")
-      _ <- printModel(modelIR) // for printing the mode
+      // _ <- printModel(modelIR) // for printing the model
       _ <- IO.println("Starting HTTP service on 0.0.0.0:8080")
       _ <- EmberServerBuilder
         .default[IO]
@@ -64,6 +67,6 @@ object Main extends IOApp {
         .withPort(port"8080")
         .withHttpApp(helloWorldService)
         .build
-        .use(_ => IO.never)
+        .useForever
     } yield ExitCode.Success
 }
