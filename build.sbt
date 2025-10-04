@@ -19,17 +19,7 @@ libraryDependencies ++= Seq(
   "com.armanbilge" %%% "vilcacora-ir" % VilcacoraVersion,
   "com.armanbilge" %%% "vilcacora-onnx" % VilcacoraVersion,
   "com.armanbilge" %%% "vilcacora-runtime" % VilcacoraVersion,
-
-  
-
-)
-nativeConfig ~= { c =>
-  c.withLinkingOptions(
-    c.linkingOptions ++ Seq(
-      "-lsvm",
-      "-lc++",    
-      "-lc++abi",   
-    )
   )
-}
+nativeConfig ~= { _.withEmbedResources(true) }
+
 
