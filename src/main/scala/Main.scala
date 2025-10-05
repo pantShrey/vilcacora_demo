@@ -12,15 +12,14 @@ import vilcacora.onnx.Translator._
 import com.armanbilge.vilcacora.ir._
 import com.armanbilge.vilcacora.runtime._
 import vilcacora.onnx.Translator
+import fs2.{Stream, io}
+
 object Main extends IOApp {
 
-  def loadModelFromPath(modelPath: String): IO[ModelProto] = IO.blocking {
-    val stream: InputStream = getClass.getResourceAsStream(modelPath)
-    if (stream == null)
-      throw new IllegalArgumentException(s"Resource not found: $modelPath")
-    try ModelProto.parseFrom(stream)
+  def loadModelFromPath(modelPath: String): IO[ModelProto] = {
+    val byteStream: Stream[IO, Byte] = io.readClassLoaderResource[IO](modelPath)
+    byteStream.compile.to(Array).flatMap(bytes => IO.blocking(ModelProto.parseFrom(bytes)))
 
-    finally stream.close()
   }
 
   def translateModel(proto: ModelProto): IO[ModelIR] =
