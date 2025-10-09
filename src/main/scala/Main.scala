@@ -20,7 +20,8 @@ import org.http4s.Request
 import org.http4s.EntityEncoder
 import org.http4s.EntityDecoder
 import org.http4s.Response
-
+import org.typelevel.keypool.KeyPool
+import scala.concurrent.duration._
 object Main extends IOApp {
 
   def loadModelFromPath(modelPath: String): IO[ModelProto] = {
@@ -64,86 +65,113 @@ object Main extends IOApp {
   def makeInputBuffer(): Array[Float] =
     Array.fill(1 * 1 * 28 * 28)(0f)
 
+  def bufferPool(inputBuffer: Array[Float]): Resource[IO, KeyPool[IO, Unit, Array[Float]]] =
+    KeyPool
+      .Builder[IO, Unit, Array[Float]](
+        // The pool doesn't create a new buffer, it just returns the existing one.
+        create = _ => IO.pure(inputBuffer),
+        // The destroy action is a no-op, so our buffer is never deallocated.
+        destroy = _ => IO.unit,
+      )
+      .withMaxPerKey(_ => 1)
+      .withMaxTotal(1)
+      .withIdleTimeAllowedInPool(Duration.Inf) // Never destroy the buffer due to inactivity.
+      .build
+
   def run(args: List[String]): IO[ExitCode] = {
-    val program = for {
+    val appSetup = for {
       _ <- IO.println("Loading Model")
       modelproto <- loadModelFromPath("/mnist12_static.onnx")
       modelIR <- translateModel(modelproto)
       _ <- IO.println("Successfully Loaded Model")
 
-      inputBuffer = makeInputBuffer()
       inputName <- IO.fromOption(modelIR.graphInputs.headOption)(
-        new RuntimeException(
-          "Model has no graph inputs",
-        ), // should not happen due to checks in translator
+        new RuntimeException("Model has no graph inputs"), // should not happen
       )
       outputName <- IO.fromOption(modelIR.graphOutputs.headOption)(
-        new RuntimeException(
-          "Model has no graph outputs",
-        ), // should not happen due to checks in translator
+        new RuntimeException("Model has no graph outputs"), // should not happen
       )
+    } yield (modelIR, inputName, outputName)
 
-      _ <- IO.println("Starting HTTP service on 0.0.0.0:8080")
+    appSetup
+      .flatMap { case (modelIR, inputName, outputName) =>
+        // The single, shared buffer instance that will be protected by the pool.
+        val inputBuffer = makeInputBuffer()
 
-      exitCode <- Interpreter
-        .execute(modelIR, Map(inputName -> inputBuffer))
-        .use { runInference =>
-          val inferApp = HttpRoutes
-            .of[IO] {
-              case GET -> Root / "hello" / name =>
-                Ok(s"Hello, $name.")
+        // Compose the KeyPool and Interpreter resources.
+        val serverResources = for {
+          pool <- bufferPool(inputBuffer)
+          runInference <- Interpreter.execute(modelIR, Map(inputName -> inputBuffer))
+        } yield (pool, runInference)
 
-              case req @ POST -> Root / "infer" =>
-                (for {
-                  inputArray <- req.as[Array[Float]]
-                  _ <- IO {
-                    if (inputArray.length != inputBuffer.length) {
-                      throw new IllegalArgumentException(
-                        s"Invalid input size: expected ${inputBuffer.length}, got ${inputArray.length}",
-                      )
+        // Use the composed resources to run the server.
+        serverResources
+          .use { case (pool, runInference) =>
+            IO.println("Starting HTTP service on 0.0.0.0:8080") >> {
+              val inferApp = HttpRoutes
+                .of[IO] {
+                  case GET -> Root / "hello" / name =>
+                    Ok(s"Hello, $name.")
+
+                  case req @ POST -> Root / "infer" =>
+                    // For each request, take a "lease" on the buffer.
+                    // This will block if the buffer is already in use, ensuring sequential access.
+                    pool.take(()).use { managedBuffer =>
+                      val lockedInputBuffer = managedBuffer.value
+                      (for {
+                        inputArray <- req.as[Array[Float]]
+
+                        _ <- IO {
+                          if (inputArray.length != lockedInputBuffer.length) {
+                            throw new IllegalArgumentException(
+                              s"Invalid input size: expected ${lockedInputBuffer.length}, got ${inputArray.length}",
+                            )
+                          }
+                          // This mutation is now safe from race conditions.
+                          System.arraycopy(
+                            inputArray,
+                            0,
+                            lockedInputBuffer,
+                            0,
+                            lockedInputBuffer.length,
+                          )
+                        }
+                        // `runInference` uses the buffer that we just safely mutated.
+                        outputMap <- runInference
+                        output <- IO.fromOption(outputMap.get(outputName))(
+                          new RuntimeException(s"Output $outputName not found in inference results"),
+                        )
+                        result <- IO(output.asInstanceOf[Array[Float]])
+                        resp <- Ok(result)
+                      } yield resp).handleErrorWith {
+                        case e: org.http4s.DecodeFailure =>
+                          BadRequest(s"Invalid JSON input: ${e.getMessage()}")
+                        case e: IllegalArgumentException =>
+                          BadRequest(e.getMessage)
+                        case e: ClassCastException =>
+                          InternalServerError(s"Internal error: unexpected output type")
+                        case e =>
+                          IO.println(s"Inference error: ${e.getMessage}") >>
+                            InternalServerError(s"Inference failed: ${e.getMessage}")
+                      }
                     }
-                    System.arraycopy(inputArray, 0, inputBuffer, 0, inputBuffer.length)
-                  }
-                  outputMap <- runInference
-                  output <- IO.fromOption(outputMap.get(outputName))(
-                    new RuntimeException(s"Output $outputName not found in inference results"),
-                  )
-                  result <- IO {
-                    output.asInstanceOf[Array[Float]]
-                  }
-                  resp <- Ok(result)
-                } yield resp).handleErrorWith {
-                  case e: org.http4s.DecodeFailure =>
-                    BadRequest(s"Invalid JSON input: ${e.getMessage()}")
-                  case e: IllegalArgumentException =>
-                    BadRequest(e.getMessage)
-                  case e: ClassCastException =>
-                    InternalServerError(s"Internal error: unexpected output type")
-                  case e =>
-                    IO.println(s"Inference error: ${e.getMessage}") >>
-                      InternalServerError(s"Inference failed: ${e.getMessage}")
                 }
+                .orNotFound
+
+              EmberServerBuilder
+                .default[IO]
+                .withHost(ipv4"0.0.0.0")
+                .withPort(port"8080")
+                .withHttpApp(inferApp)
+                .build
+                .use(_ => IO.never)
             }
-            .orNotFound
-
-          EmberServerBuilder
-            .default[IO]
-            .withHost(ipv4"0.0.0.0")
-            .withPort(port"8080")
-            .withHttpApp(inferApp)
-            .build
-            .use(_ => IO.never)
-            .as(ExitCode.Success)
-        }
-        .handleErrorWith { error =>
-          IO.println(s"Failed to execute interpreter: ${error.getMessage}") >>
-            IO.raiseError(error)
-        }
-    } yield exitCode
-
-    program.handleErrorWith { error =>
-      IO.println(s"Application failed: ${error.getMessage}") >>
-        IO.pure(ExitCode.Error)
-    }
+          }
+          .as(ExitCode.Success)
+      }
+      .handleErrorWith { error =>
+        IO.println(s"Application failed: ${error.getMessage}") >>
+          IO.pure(ExitCode.Error)
+      }
   }
 }

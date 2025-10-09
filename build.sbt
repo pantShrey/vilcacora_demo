@@ -17,6 +17,7 @@ libraryDependencies ++= Seq(
   "org.http4s" %%% "http4s-dsl"          % Http4sVersion,
   "org.http4s" %%% "http4s-circe" % Http4sVersion,
   "io.circe" %%% "circe-generic" % "0.14.12",
+  "org.typelevel" %%% "keypool" % "0.5.0-RC1",
   "com.armanbilge" %%% "vilcacora-ir" % VilcacoraVersion,
   "com.armanbilge" %%% "vilcacora-onnx" % VilcacoraVersion,
   "com.armanbilge" %%% "vilcacora-runtime" % VilcacoraVersion,
