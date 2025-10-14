@@ -22,6 +22,7 @@ import org.http4s.EntityDecoder
 import org.http4s.Response
 import org.typelevel.keypool.KeyPool
 import scala.concurrent.duration._
+
 object Main extends IOApp {
 
   def loadModelFromPath(modelPath: String): IO[ModelProto] = {
@@ -43,39 +44,41 @@ object Main extends IOApp {
   implicit val encoder: EntityEncoder[IO, Array[Float]] = jsonEncoderOf[IO, Array[Float]]
   implicit val decoder: EntityDecoder[IO, Array[Float]] = jsonOf[IO, Array[Float]]
 
-  def printModel(model: ModelIR): IO[Unit] = IO {
-    println("Model ------")
-    println(s"Name: ${model.name}")
-
-    println("Operations:")
-    model.operations.foreach(op => println(s"  $op"))
-
-    println("Allocations:")
-    model.allocations.foreach { case (key, alloc) =>
-      println(s"  $key -> $alloc")
-    }
-
-    println("Graph Inputs:")
-    model.graphInputs.foreach(input => println(s"  $input"))
-
-    println("Graph Outputs:")
-    model.graphOutputs.foreach(output => println(s"  $output"))
-  }
+  // Case class to encapsulate the complete inference session
+  case class InferenceSession(
+      inputBuffer: Array[Float],
+      runInference: IO[Map[String, Any]],
+  )
 
   def makeInputBuffer(): Array[Float] =
     Array.fill(1 * 1 * 28 * 28)(0f)
 
-  def bufferPool(inputBuffer: Array[Float]): Resource[IO, KeyPool[IO, Unit, Array[Float]]] =
+  // A resource that manages the complete inference session
+  def inferenceSessionResource(
+      modelIR: ModelIR,
+      inputName: String,
+  ): Resource[IO, InferenceSession] =
+    for {
+      inputBuffer <- Resource.eval(IO(makeInputBuffer()))
+      runInference <- Interpreter.execute(modelIR, Map(inputName -> inputBuffer))
+    } yield InferenceSession(inputBuffer, runInference)
+
+  // KeyPool for managing inference sessions
+  def inferenceSessionPool(
+      modelIR: ModelIR,
+      inputName: String,
+  ): Resource[IO, KeyPool[IO, Unit, InferenceSession]] =
     KeyPool
-      .Builder[IO, Unit, Array[Float]](
-        // The pool doesn't create a new buffer, it just returns the existing one.
-        create = _ => IO.pure(inputBuffer),
-        // The destroy action is a no-op, so our buffer is never deallocated.
+      .Builder[IO, Unit, InferenceSession](
+        // Create function - creates a new inference session with allocated memory
+        create = _ => inferenceSessionResource(modelIR, inputName).allocated.map(_._1),
+        // Destroy function - since we're using Resource.allocated, the cleanup is handled automatically
+        // We can make this a no-op since the Resource cleanup will be called when the pool is destroyed
         destroy = _ => IO.unit,
       )
-      .withMaxPerKey(_ => 1)
-      .withMaxTotal(1)
-      .withIdleTimeAllowedInPool(Duration.Inf) // Never destroy the buffer due to inactivity.
+      .withMaxPerKey(_ => 2) //  inference session per key (we're using Unit as key)
+      .withMaxTotal(2) // Total of  inference session in the pool
+      .withIdleTimeAllowedInPool(Duration.Inf) // Never destroy due to inactivity
       .build
 
   def run(args: List[String]): IO[ExitCode] = {
@@ -86,27 +89,18 @@ object Main extends IOApp {
       _ <- IO.println("Successfully Loaded Model")
 
       inputName <- IO.fromOption(modelIR.graphInputs.headOption)(
-        new RuntimeException("Model has no graph inputs"), // should not happen
+        new RuntimeException("Model has no graph inputs"),
       )
       outputName <- IO.fromOption(modelIR.graphOutputs.headOption)(
-        new RuntimeException("Model has no graph outputs"), // should not happen
+        new RuntimeException("Model has no graph outputs"),
       )
     } yield (modelIR, inputName, outputName)
 
     appSetup
       .flatMap { case (modelIR, inputName, outputName) =>
-        // The single, shared buffer instance that will be protected by the pool.
-        val inputBuffer = makeInputBuffer()
-
-        // Compose the KeyPool and Interpreter resources.
-        val serverResources = for {
-          pool <- bufferPool(inputBuffer)
-          runInference <- Interpreter.execute(modelIR, Map(inputName -> inputBuffer))
-        } yield (pool, runInference)
-
-        // Use the composed resources to run the server.
-        serverResources
-          .use { case (pool, runInference) =>
+        // Use the inference session pool
+        inferenceSessionPool(modelIR, inputName)
+          .use { pool =>
             IO.println("Starting HTTP service on 0.0.0.0:8080") >> {
               val inferApp = HttpRoutes
                 .of[IO] {
@@ -114,30 +108,29 @@ object Main extends IOApp {
                     Ok(s"Hello, $name.")
 
                   case req @ POST -> Root / "infer" =>
-                    // For each request, take a "lease" on the buffer.
-                    // This will block if the buffer is already in use, ensuring sequential access.
-                    pool.take(()).use { managedBuffer =>
-                      val lockedInputBuffer = managedBuffer.value
+                    // Take a lease on the complete inference session
+                    pool.take(()).use { managedSession =>
+                      val session = managedSession.value
                       (for {
                         inputArray <- req.as[Array[Float]]
 
                         _ <- IO {
-                          if (inputArray.length != lockedInputBuffer.length) {
+                          if (inputArray.length != session.inputBuffer.length) {
                             throw new IllegalArgumentException(
-                              s"Invalid input size: expected ${lockedInputBuffer.length}, got ${inputArray.length}",
+                              s"Invalid input size: expected ${session.inputBuffer.length}, got ${inputArray.length}",
                             )
                           }
-                          // This mutation is now safe from race conditions.
+                          // This mutation is now safe from race conditions
                           System.arraycopy(
                             inputArray,
                             0,
-                            lockedInputBuffer,
+                            session.inputBuffer,
                             0,
-                            lockedInputBuffer.length,
+                            session.inputBuffer.length,
                           )
                         }
-                        // `runInference` uses the buffer that we just safely mutated.
-                        outputMap <- runInference
+                        // Use the pre-allocated inference session
+                        outputMap <- session.runInference
                         output <- IO.fromOption(outputMap.get(outputName))(
                           new RuntimeException(s"Output $outputName not found in inference results"),
                         )
