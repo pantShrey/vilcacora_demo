@@ -2,14 +2,13 @@ scalaVersion := "3.3.4"
 
 enablePlugins(ScalaNativePlugin,ScalaNativeBrewedConfigPlugin)
 
-// set to Debug for compilation details (Info is default)
 logLevel := Level.Info
 ThisBuild / resolvers += Resolver.sonatypeCentralSnapshots
-// import to add Scala Native options
+
 import scala.scalanative.build._
 
 val Http4sVersion = "0.23.30-161-f5b9629-SNAPSHOT"
-val VilcacoraVersion = "0.0-e6dd86c-SNAPSHOT"
+val VilcacoraVersion = "0.0-3576791-20260517T085109Z-SNAPSHOT" //local library snapshot 
 nativeBrewFormulas ++= Set("cereal", "openblas", "mlpack", "libsvm")
 libraryDependencies ++= Seq(
   "org.http4s" %%% "http4s-ember-client" % Http4sVersion,
